@@ -1,0 +1,88 @@
+hosts:
+  "root_a":
+    tags: [root]
+    zones: 
+      - foo
+      - baz
+      - drop
+      - delay
+      - trunc
+    records: []
+    additional_config: []
+  "foo":
+    tags: []
+    zones: 
+      - bar
+    records: |
+      @ IN MX 20 mail
+      www IN A 89.2.33.1
+      mail IN CNAME server
+      server IN CNAME other
+      other IN A 1.2.3.4
+    additional_config: []
+  "bar_foo":
+    tags: []
+    zones: 
+      - sub
+    records: |
+      @	IN	A	1.2.3.4
+      www	IN	CNAME	web
+      web	IN	A	5.6.7.8
+      link  IN  CNAME www.sub
+      otherlink IN  CNAME server.baz.
+    additional_config: []
+  "sub_bar_foo":
+    tags: []
+    zones: []
+    records: |
+      @	IN	A	1.2.3.4
+      www	IN	CNAME	web
+      web	IN	A	99.88.55.44
+    additional_config: []
+  "drop":
+    tags: []
+    zones:
+      - sub
+    records: []
+    additional_config: []
+  "sub_drop":
+    tags: [drop]
+    zones: []
+    records: |
+      @	IN	A	192.0.2.53
+      web	IN	A	192.0.2.53
+    additional_config: |
+      erratic {
+        drop 2
+      }    
+  "delay":
+    tags: []
+    zones:
+      - test
+    records: []
+    additional_config: []
+  "test_delay":
+    tags: [delay]
+    zones: []
+    records: |
+      www	IN	A	192.0.2.53
+    additional_config: |
+      erratic {
+        delay 2 1000ms
+      }  
+  "trunc":
+    tags: [truncate]
+    zones: []
+    records: |
+      test	IN	A	192.0.2.53
+    additional_config: |
+      erratic {
+        truncate 2
+      }    
+  "baz":
+    tags: []
+    zones: []
+    records: |
+      server IN CNAME other
+      other IN A 66.3.9.44
+    additional_config: []
