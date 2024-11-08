@@ -30,6 +30,8 @@ ROOT_SERVER_IP = None
 REFERENCE_SERVER_IP = None
 REFERENCE_SERVER_PORT = None
 
+CACHE_TIME = 5 + 2
+
 #### CODE
 
 simulator = None
@@ -189,11 +191,13 @@ class Request:
     self.id = id
     self.universe = universe
     self.authoritative = authoritative
+    self.tags = tags
+    self.level = level
 
     self.send_time = time
 
     self.select_lookup(level, tags)
-    self.request = self.make_request()
+    self.make_request()
     self.sent_time = None
 
     self.response_reference = None
@@ -201,6 +205,15 @@ class Request:
     self.received_time = None
 
     self.log("Created request %d to go off at %s" % (self.id, self.send_time))
+
+  def clone(self, id, time):
+    req = Request(self.client, id, time, self.level, self.authoritative, self.universe, self.tags)
+    req.request_label = self.request_label
+    req.request_type = self.request_type
+    req.make_request()
+    req.request.header.id = id
+
+    return req
 
   def select_lookup(self, level, tags):
     if level < 10:
@@ -216,7 +229,6 @@ class Request:
   def make_request(self):
     self.request = DNSRecord(q=DNSQuestion(self.request_label, self.request_type if self.request_type!=QTYPE.CNAME else QTYPE.A))
     self.request.header.id = self.id 
-    return self.request
 
   def wake(self):
     if now() > self.send_time and self.sent_time is None:
@@ -238,7 +250,7 @@ class Request:
 
       self.response_reference = response
 
-  def check_response(self):
+  def check_response(self, all_responses):
     if not self.response_executable:
       self.log("Never received response for request %d" % self.id)
       return False
@@ -246,6 +258,21 @@ class Request:
     if not self.response_reference:
       self.log("Never received reference response for request %d" % self.id)
       return False
+    
+    if any(map(lambda t: "cache" in t, self.tags)):
+      if len(all_responses) != 3:
+        self.log("Received unexpected number of responses to cache test: %d" % len(all_responses))
+        return False
+      
+      if (all_responses[0].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[1].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[0].response_executable.get_a().rdata != all_responses[1].response_executable.get_a().rdata):
+        self.log("Detecting non-caching of first query pair.  Response 1:\n%s\n\nResponse 2:\n%s\n" % (all_responses[0].response_executable, all_responses[1].response_executable))
+        return False
+            
+      if (all_responses[0].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[2].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[0].response_executable.get_a().rdata == all_responses[2].response_executable.get_a().rdata):
+        self.log("Detecting unallowed caching of response.  Response 1:\n%s\n\nResponse 3:\n%s\n" % (all_responses[0].response_executable, all_responses[2].response_executable))
+        return False
+      
+      return True
 
     def merge_answer_authority(resp):
       return DNSRecord(header=resp.header,questions=resp.questions, rr=resp.rr+resp.auth,ar=resp.ar)
@@ -285,13 +312,27 @@ class Client:
 
     self.log("Bound to IP %s port %d" % (self.ip, self.port))
 
-  def generate_request(self, id):
-    request = Request(self, id, random.random() * self.lifetime, self.level, self.authoritative, self.universe, self.config["tags"])
+  def generate_request(self, id, time):
+    request = Request(self, id, time, self.level, self.authoritative, self.universe, self.config["tags"])
     return (id, request)
 
   def generate_requests(self):
-    ids = random.sample(range(0, 65536), self.config["requests"])
-    return dict([self.generate_request(ids[i]) for i in range(self.config["requests"])])
+    num = self.config["requests"]
+
+    ids = random.sample(range(0, 65536), 3*num)
+    times = [random.random() * self.lifetime for i in range(2*num)]
+
+    requests = [self.generate_request(ids[i], times[i]) for i in range(num)]
+
+    # If it's a caching test, add secondary requests after cache expiration
+    if self.config['cache']:
+      # Add the second request that's supposed to be cached
+      requests += [(ids[num+i], requests[i][1].clone(ids[num+i], times[num+i])) for i in range(num)]
+
+      # Add the third request that's supposed to not be cached
+      requests += [(ids[2*num+i], requests[i][1].clone(ids[2*num+i], requests[i][1].send_time + CACHE_TIME)) for i in range(num)]
+
+    return dict(requests)
 
   def log(self, msg):
     log("Client %d" % self.id, msg)
@@ -325,7 +366,7 @@ class Client:
   def check_responses(self):
     failed = 0
     for id in self.requests.keys():
-      failed += 0 if self.requests[id].check_response() else 1
+      failed += 0 if self.requests[id].check_response(list(self.requests.values())) else 1
 
     if failed ==0:
       self.log("All responses correctly verified")
@@ -488,6 +529,7 @@ if len(sys.argv) != 2:
 
 get_executable(EXECUTABLE_NAME)
 config = get_config(sys.argv[1])
+config['simulator']['cache'] = any(map(lambda t: "cache" in t, config["simulator"]["tags"]))
 
 if "seed" in config:
   random.seed(config["seed"])
@@ -503,6 +545,9 @@ universe = get_universe(config)
 
 # Set up the DNS infrastructure
 simulator = Simulator(config["simulator"], authoritative, universe)
+
+# Adjust grace period if we're doing a caching test
+GRACE_PERIOD = CACHE_TIME + GRACE_PERIOD if config['simulator']['cache'] else GRACE_PERIOD
 
 try:
   simulator.start()
