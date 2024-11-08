@@ -47,6 +47,7 @@ hosts:
     zones: []
     records: |
       www	IN	A	10.11.12.13
+      web	IN	A	10.11.12.14
     additional_config: |
       template IN ANY bailiwick.foo {
         match "^www\.bailiwick\.foo\.$"
