@@ -4,7 +4,7 @@ import argparse, socket, time, json, select, struct, sys, math
 from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
 
 class Server:
-    def __init__(self, host, root_ip, domain, port):
+    def __init__(self, root_ip, domain, port):
         self.root_ip = root_ip
         self.domain = domain
 
@@ -51,5 +51,5 @@ if __name__ == "__main__":
     parser.add_argument('zone', type=str, help="The zone file for this server")
     parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
     args = parser.parse_args()
-    sender = Server(args.host, args.root_ip, args.zone, args.port)
+    sender = Server(args.root_ip, args.zone, args.port)
     sender.run()
