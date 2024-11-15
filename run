@@ -38,7 +38,8 @@ simulator = None
 
 def die(msg):
   print("\nError: %s" % msg)
-  simulator.stop()
+  if simulator:
+    simulator.stop()
   sys.exit(0)
 
 start = time.time()
