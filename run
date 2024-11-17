@@ -472,7 +472,6 @@ class Universe:
     self.records.append(record)
 
     self.walk_tree(roots[0], [], root=True)
-    print(self.records)
 
   def walk_tree(self, key, tags, level=0, root=False):
     label = "." if root else key.replace("_", ".")

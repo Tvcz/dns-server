@@ -24,7 +24,7 @@ hosts:
       txt IN TXT "this is text"
     additional_config: []
   "bar_foo":
-    tags: []
+    tags: [nodrop, nodelay, notrunc]
     zones: 
       - sub
     records: |
@@ -116,7 +116,7 @@ hosts:
         truncate 2
       }    
   "baz":
-    tags: []
+    tags: [nodrop, nodela, notrunc]
     zones: []
     records: |
       server IN CNAME other
