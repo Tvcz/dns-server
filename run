@@ -239,14 +239,14 @@ class Request:
   def received_response(self, response, reference=False):
     if not reference:
       if self.response_executable != None:
-        self.log("Received duplicate response with id %; ignoring" % self.id)
+        self.log("Received duplicate response with id %d; ignoring" % self.id)
         return
 
       self.received_time = now()
       self.response_executable = response
     else:
       if self.response_reference != None:
-        self.log("Received duplicate reference response with id %; ignoring" % self.id)
+        self.log("Received duplicate reference response with id %d; ignoring" % self.id)
         return
 
       self.response_reference = response
