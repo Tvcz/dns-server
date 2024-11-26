@@ -31,6 +31,7 @@ REFERENCE_SERVER_IP = None
 REFERENCE_SERVER_PORT = None
 
 CACHE_TIME = 5 + 2
+DROP_TIME = 6 + 2
 
 #### CODE
 
@@ -530,6 +531,7 @@ if len(sys.argv) != 2:
 get_executable(EXECUTABLE_NAME)
 config = get_config(sys.argv[1])
 config['simulator']['cache'] = any(map(lambda t: "cache" in t, config["simulator"]["tags"]))
+config['simulator']['drop'] = any(map(lambda t: "drop" in t, config["simulator"]["tags"]))
 
 if "seed" in config:
   random.seed(config["seed"])
@@ -548,6 +550,7 @@ simulator = Simulator(config["simulator"], authoritative, universe)
 
 # Adjust grace period if we're doing a caching test
 GRACE_PERIOD = CACHE_TIME + GRACE_PERIOD if config['simulator']['cache'] else GRACE_PERIOD
+GRACE_PERIOD = DROP_TIME + GRACE_PERIOD if config['simulator']['drop'] else GRACE_PERIOD
 
 try:
   simulator.start()
