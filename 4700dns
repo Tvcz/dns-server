@@ -15,7 +15,7 @@ import glob
 
 _Address: TypeAlias = Any
 
-ENABLE_LOG = False
+ENABLE_LOG = True
 
 if ENABLE_LOG:
     for log_file in glob.glob("log-*.txt"):
@@ -61,7 +61,7 @@ class Server:
         self.send((ip, 60053), message)
 
     def send(self, addr: _Address, message: DNSRecord):
-        self.log(f"Sending message:\n{message}")
+        self.log(f"Sending message to {addr}:\n{message}")
         self.socket.sendto(message.pack(), addr)
 
     def recv(self, socket: socket.socket):
@@ -69,7 +69,7 @@ class Server:
 
         # Unpack the DNS request
         request = DNSRecord.parse(data)
-        self.log(f"Received message:\n{request}")
+        self.log(f"Received message from {addr}:\n{request}")
 
         # Handle the request
         self.handle_message(request, addr)
@@ -88,12 +88,15 @@ class Server:
 
     def handle_authoritative_request(self, dns_record: DNSRecord, client_addr: _Address):
         response = dns_record.reply()
+
+        # add answers to the answer section
         for record in self.records:
             same_name = record.rname == dns_record.q.qname
             same_type = record.rtype == dns_record.q.qtype
             if same_name and same_type:
                 response.add_answer(record)
 
+        # add NS records to the authority section
         auth_added = False
         auth_domain = str(record.rname)
         while not auth_added:
@@ -104,6 +107,12 @@ class Server:
                     response.add_auth(record)
                     auth_added = True
             auth_domain = ".".join(auth_domain.split(".")[1:])
+
+        # add A records for CNAME and NS queries
+        if record.rtype == QTYPE.CNAME or record.rtype == QTYPE.NS:
+            for record in self.records:
+                if record.rname == record.rdata and record.rtype == QTYPE.A:
+                    response.add_ar(record)
         self.send(client_addr, response)
 
     def handle_recursive_request(self, dns_record: DNSRecord, client_addr: _Address):
@@ -117,14 +126,15 @@ class Server:
         domain = dns_record.q.qname
         record_type = QTYPE[dns_record.q.qtype]
         request = DNSRecord.question(domain, record_type)
+        record_id = dns_record.header.id
         request_id = request.header.id
-        log(request_id,
+        log(record_id,
             f"Received request for {domain} of type {record_type} from {client_addr}")
-        log(request_id, f"Sending request to {self.root_ip}")
-        log(request_id, f"Request:\n{request}")
+        log(record_id, f"Sending request to {self.root_ip}")
+        log(record_id, f"Request:\n{request}")
         self.send_to_server(self.root_ip, request)
         self.ongoing_queries[request_id] = (
-            dns_record, client_addr, request_id)
+            dns_record, client_addr, record_id)
 
     def handle_response(self, dns_record: DNSRecord, server_addr: _Address):
         if dns_record.header.id in self.ongoing_queries:
@@ -133,9 +143,9 @@ class Server:
             record, client_addr, request_id = self.ongoing_queries[dns_record.header.id]
             log(request_id,
                 f"Received response from {server_addr} for {dns_record.q.qname}")
+            log(request_id, f"Response:\n{dns_record}")
             del self.ongoing_queries[dns_record.header.id]
-            if dns_record.header.aa == 1:
-                log(request_id, f"Response:\n{dns_record}")
+            if dns_record.header.aa == 1 or dns_record.header.auth == 1:
                 log(request_id, "Authoritative response, sending to client")
                 response = record.reply()
                 response.header.aa = 0
@@ -146,20 +156,33 @@ class Server:
                 for additional in dns_record.ar:
                     response.add_ar(additional)
                 self.send(client_addr, response)
+            elif dns_record.header.rcode == 2:
+                log(request_id, "Received SERVFAIL, sending to client")
+                response = record.reply()
+                response.header.rcode = 2
+                self.send(client_addr, response)
             else:
                 # Find next hop
+                # todo: fix assumption that additional section contains A record
+                log(request_id,
+                    f"Non-authoritative response, looking for next hop AA: {dns_record.header.aa}")
                 if dns_record.ar:
                     for additional in dns_record.ar:
                         if additional.rtype == QTYPE.A:
                             next_hop_ip = str(additional.rdata)
-                            request = record.question(dns_record.q.qname)
-                            self.send_to_server(next_hop_ip, record)
+                            domain = record.q.qname
+                            record_type = QTYPE[record.q.qtype]
+                            request = record.question(
+                                domain, record_type)
+                            self.send_to_server(next_hop_ip, request)
                             log(request_id,
-                                f"Forwarding to {next_hop_ip} for {dns_record.q.qname}")
+                                f"Forwarding to {next_hop_ip} for {domain} of type {record_type}")
                             self.ongoing_queries[request.header.id] = (
                                 record, client_addr, request_id)
                             return
                 log(request_id, "No additional section with A record found")
+        else:
+            log(0, f"Received response for unknown query:\n{dns_record}")
 
     def run(self):
         seq = 0
