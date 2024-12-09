@@ -1,0 +1,183 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import os
+import socket
+import time
+import json
+import select
+import struct
+import sys
+import math
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+from typing import Any, TypeAlias
+import glob
+
+_Address: TypeAlias = Any
+
+ENABLE_LOG = False
+
+if ENABLE_LOG:
+    for log_file in glob.glob("log-*.txt"):
+        os.remove(log_file)
+
+
+def log(id, message):
+    if not ENABLE_LOG:
+        return
+    with open(f"log-{id}.txt", "a+") as f:
+        timestamp = time.strftime("%H:%M:%S") + \
+            f".{int(time.time() * 1000) % 1000:03d}"
+        f.write(f"[{timestamp}] {message}\n")
+        pass
+
+
+class Server:
+    def __init__(self, root_ip, zone_file_path, port):
+        self.root_ip = root_ip
+        self.zone_file_path = zone_file_path
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", port))
+        self.port = self.socket.getsockname()[1]
+
+        self.log(f"Bound to port {self.port}")
+
+        self.parse_zone_file()
+
+        self.ongoing_queries: dict[int, (DNSRecord, _Address, int)] = {}
+
+    def parse_zone_file(self):
+        zone_files_string = open(self.zone_file_path).read()
+        self.records = RR.fromZone(zone_files_string)
+        for record in self.records:
+            self.log(f"Loaded record: {record}")
+
+    def log(self, message: str):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send_to_server(self, ip: str, message: DNSRecord):
+        self.send((ip, 60053), message)
+
+    def send(self, addr: _Address, message: DNSRecord):
+        self.log(f"Sending message:\n{message}")
+        self.socket.sendto(message.pack(), addr)
+
+    def recv(self, socket: socket.socket):
+        data, addr = socket.recvfrom(65535)
+
+        # Unpack the DNS request
+        request = DNSRecord.parse(data)
+        self.log(f"Received message:\n{request}")
+
+        # Handle the request
+        self.handle_message(request, addr)
+
+    def handle_message(self, message: DNSRecord, ret_addr: _Address):
+        if message.header.qr == 0:
+            self.handle_request(message, ret_addr)
+        else:
+            self.handle_response(message, ret_addr)
+
+    def handle_request(self, dns_record: DNSRecord, client_addr: _Address):
+        if dns_record.q.qname in [record.rname for record in self.records]:
+            self.handle_authoritative_request(dns_record, client_addr)
+        else:
+            self.handle_recursive_request(dns_record, client_addr)
+
+    def handle_authoritative_request(self, dns_record: DNSRecord, client_addr: _Address):
+        response = dns_record.reply()
+        for record in self.records:
+            same_name = record.rname == dns_record.q.qname
+            same_type = record.rtype == dns_record.q.qtype
+            if same_name and same_type:
+                response.add_answer(record)
+
+        auth_added = False
+        auth_domain = str(record.rname)
+        while not auth_added:
+            if auth_domain == "":
+                break
+            for record in self.records:
+                if str(record.rname) == auth_domain and record.rtype == QTYPE.NS:
+                    response.add_auth(record)
+                    auth_added = True
+            auth_domain = ".".join(auth_domain.split(".")[1:])
+        self.send(client_addr, response)
+
+    def handle_recursive_request(self, dns_record: DNSRecord, client_addr: _Address):
+        if dns_record.header.rd == 0:
+            # Send SERVFAIL
+            response = dns_record.reply()
+            response.header.rcode = 2
+            self.send(client_addr, response)
+            self.log("Sending SERVFAIL, recursion flag not set")
+            return
+        domain = dns_record.q.qname
+        record_type = QTYPE[dns_record.q.qtype]
+        request = DNSRecord.question(domain, record_type)
+        request_id = request.header.id
+        log(request_id,
+            f"Received request for {domain} of type {record_type} from {client_addr}")
+        log(request_id, f"Sending request to {self.root_ip}")
+        log(request_id, f"Request:\n{request}")
+        self.send_to_server(self.root_ip, request)
+        self.ongoing_queries[request_id] = (
+            dns_record, client_addr, request_id)
+
+    def handle_response(self, dns_record: DNSRecord, server_addr: _Address):
+        if dns_record.header.id in self.ongoing_queries:
+            record: DNSRecord
+            request_id: int
+            record, client_addr, request_id = self.ongoing_queries[dns_record.header.id]
+            log(request_id,
+                f"Received response from {server_addr} for {dns_record.q.qname}")
+            del self.ongoing_queries[dns_record.header.id]
+            if dns_record.header.aa == 1:
+                log(request_id, f"Response:\n{dns_record}")
+                log(request_id, "Authoritative response, sending to client")
+                response = record.reply()
+                response.header.aa = 0
+                for answer in dns_record.rr:
+                    response.add_answer(answer)
+                for auth in dns_record.auth:
+                    response.add_auth(auth)
+                for additional in dns_record.ar:
+                    response.add_ar(additional)
+                self.send(client_addr, response)
+            else:
+                # Find next hop
+                if dns_record.ar:
+                    for additional in dns_record.ar:
+                        if additional.rtype == QTYPE.A:
+                            next_hop_ip = str(additional.rdata)
+                            request = record.question(dns_record.q.qname)
+                            self.send_to_server(next_hop_ip, record)
+                            log(request_id,
+                                f"Forwarding to {next_hop_ip} for {dns_record.q.qname}")
+                            self.ongoing_queries[request.header.id] = (
+                                record, client_addr, request_id)
+                            return
+                log(request_id, "No additional section with A record found")
+
+    def run(self):
+        seq = 0
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            for conn in socks:
+                self.recv(conn)
+
+        return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str,
+                        help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int,
+                        help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
