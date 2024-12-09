@@ -1,0 +1,7 @@
+for conf in ./configs/*.conf; do
+  ./run "$conf" | tee output.log
+  if ! grep -q "All simulation responses verified" output.log; then
+    echo "Failed configuration: $conf"
+    break
+  fi
+done
