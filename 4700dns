@@ -9,7 +9,7 @@ import select
 import struct
 import sys
 import math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, DNSQuestion
 from typing import Any, TypeAlias
 import glob
 
@@ -32,6 +32,20 @@ def log(id, message):
         pass
 
 
+class Query:
+    def __init__(self, client_record: DNSRecord, client_addr: _Address, request_id: int):
+        self.client_record = client_record
+        self.client_addr = client_addr
+        self.id = request_id
+        self.cnames = []
+
+    def add_cname(self, cname: RR):
+        self.cnames.append(cname)
+
+    def has_chain(self):
+        return len(self.cnames) > 0
+
+
 class Server:
     def __init__(self, root_ip, zone_file_path, port):
         self.root_ip = root_ip
@@ -45,7 +59,7 @@ class Server:
 
         self.parse_zone_file()
 
-        self.ongoing_queries: dict[int, (DNSRecord, _Address, int)] = {}
+        self.ongoing_queries: dict[int, Query] = {}
 
     def parse_zone_file(self):
         zone_files_string = open(self.zone_file_path).read()
@@ -86,6 +100,12 @@ class Server:
         else:
             self.handle_recursive_request(dns_record, client_addr)
 
+    def matches_type(self, question: DNSQuestion, record: RR):
+        return question.qtype == record.rtype
+
+    def matches(self, question: DNSQuestion, record: RR):
+        return question.qname == record.rname and question.qtype == record.rtype
+
     def handle_authoritative_request(self, dns_record: DNSRecord, client_addr: _Address):
         response = dns_record.reply()
         self.add_answers_to_response(dns_record, response)
@@ -119,77 +139,111 @@ class Server:
                     if rec.rname == record.rdata and rec.rtype == QTYPE.A:
                         response.add_ar(rec)
 
-    def handle_recursive_request(self, dns_record: DNSRecord, client_addr: _Address):
-        if dns_record.header.rd == 0:
-            self.send_servfail(dns_record, client_addr)
+    def handle_recursive_request(self, incoming_record: DNSRecord, client_addr: _Address):
+        if incoming_record.header.rd == 0:
+            self.send_servfail(incoming_record, client_addr)
             return
-        domain = dns_record.q.qname
-        record_type = QTYPE[dns_record.q.qtype]
+        domain = incoming_record.q.qname
+        record_type = QTYPE[incoming_record.q.qtype]
         request = DNSRecord.question(domain, record_type)
-        record_id = dns_record.header.id
+        record_id = incoming_record.header.id
         request_id = request.header.id
         log(record_id,
             f"Received request for {domain} of type {record_type} from {client_addr}")
         log(record_id, f"Sending request to {self.root_ip}")
         log(record_id, f"Request:\n{request}")
         self.send_to_server(self.root_ip, request)
-        self.ongoing_queries[request_id] = (dns_record, client_addr, record_id)
+        self.ongoing_queries[request_id] = Query(
+            incoming_record, client_addr, record_id)
 
-    def send_servfail(self, dns_record: DNSRecord, client_addr: _Address):
-        response = dns_record.reply()
+    def send_servfail(self, query: Query):
+        response = query.client_record.reply()
         response.header.rcode = 2
-        self.send(client_addr, response)
+        self.send(query.client_addr, response)
         self.log("Sending SERVFAIL, recursion flag not set")
 
-    def handle_response(self, dns_record: DNSRecord, server_addr: _Address):
-        if dns_record.header.id in self.ongoing_queries:
-            record, client_addr, request_id = self.ongoing_queries[dns_record.header.id]
-            log(request_id,
-                f"Received response from {server_addr} for {dns_record.q.qname}")
-            log(request_id, f"Response:\n{dns_record}")
-            del self.ongoing_queries[dns_record.header.id]
-            if dns_record.header.aa == 1 or dns_record.header.auth == 1:
-                self.send_authoritative_response(
-                    record, dns_record, client_addr, request_id)
-            elif dns_record.header.rcode == 2:
-                self.send_servfail(record, client_addr)
+    def handle_response(self, incoming_record: DNSRecord, server_addr: _Address):
+        if incoming_record.header.id in self.ongoing_queries:
+            query = self.ongoing_queries[incoming_record.header.id]
+            log(query.id,
+                f"Received response from {server_addr} for {incoming_record.q.qname}")
+            log(query.id, f"Response:\n{incoming_record}")
+            del self.ongoing_queries[incoming_record.header.id]
+            if incoming_record.header.aa == 1:
+                follow_chain = True
+                for answer in incoming_record.rr:
+                    if self.matches_type(query.client_record.q, answer):
+                        follow_chain = False
+                if follow_chain:
+                    self.handle_cname_response(incoming_record, query)
+                else:
+                    self.send_authoritative_response(incoming_record, query)
+            elif incoming_record.header.auth == 1:
+                for auth_record in incoming_record.auth:
+                    if self.matches(query.client_record.q, auth_record):
+                        self.send_authoritative_response(
+                            incoming_record, query)
+                self.forward_non_authoritative_response(incoming_record, query)
+            elif incoming_record.header.rcode == 2:
+                self.send_servfail(query)
             else:
-                self.forward_non_authoritative_response(
-                    record, dns_record, client_addr, request_id)
+                self.forward_non_authoritative_response(incoming_record, query)
         else:
-            log(0, f"Received response for unknown query:\n{dns_record}")
+            log(0, f"Received response for unknown query:\n{incoming_record}")
 
-    def send_authoritative_response(self, record: DNSRecord, dns_record: DNSRecord, client_addr: _Address, request_id: int):
-        log(request_id, "Authoritative response, sending to client")
-        response = record.reply()
+    def handle_cname_response(self, incoming_record: DNSRecord, query: Query):
+        log(query.id, "CNAME response, looking for next hop")
+        for answer in incoming_record.rr:
+            if answer.rtype == QTYPE.CNAME:
+                domain = str(answer.rdata)
+                record_type = QTYPE[query.client_record.q.qtype]
+                request = query.client_record.question(domain, record_type)
+                for answer in incoming_record.rr:
+                    if answer.rtype == QTYPE.CNAME:
+                        query.add_cname(answer)
+                self.ongoing_queries[request.header.id] = query
+                self.send_to_server(self.root_ip, request)
+                log(query.id,
+                    f"Forwarding to {self.root_ip} for {domain} of type {record_type}")
+                return
+        log(query.id, "No CNAME record found")
+
+    def send_authoritative_response(self, incoming_record: DNSRecord, query: Query):
+        log(query.id, "Authoritative response, sending to client")
+        response = query.client_record.reply()
         response.header.aa = 0
-        for answer in dns_record.rr:
+        for cname in query.cnames:
+            response.add_answer(cname)
+        for answer in incoming_record.rr:
             response.add_answer(answer)
-        for auth in dns_record.auth:
+        for auth in incoming_record.auth:
             response.add_auth(auth)
-        for additional in dns_record.ar:
+        for additional in incoming_record.ar:
             response.add_ar(additional)
-        self.send(client_addr, response)
+        self.send(query.client_addr, response)
 
-    def forward_non_authoritative_response(self, record: DNSRecord, dns_record: DNSRecord, client_addr: _Address, request_id: int):
-        log(request_id,
-            f"Non-authoritative response, looking for next hop AA: {dns_record.header.aa}")
+    def forward_non_authoritative_response(self, incoming_record: DNSRecord, query: Query):
+        log(query.id,
+            f"Non-authoritative response, looking for next hop...")
         # todo: fix assumption that the first A record in the additional section
         # is the next hop (and that there is always an A record in the additional section)
-        if dns_record.ar:
-            for additional in dns_record.ar:
+        if incoming_record.ar:
+            for additional in incoming_record.ar:
                 if additional.rtype == QTYPE.A:
                     next_hop_ip = str(additional.rdata)
-                    domain = record.q.qname
-                    record_type = QTYPE[record.q.qtype]
-                    request = record.question(domain, record_type)
+                    domain = query.client_record.q.qname
+                    # If the query has a chain of CNAMEs, use the last CNAME as
+                    # the domain target instead of the original query
+                    if query.has_chain():
+                        domain = str(query.cnames[-1].rdata)
+                    record_type = QTYPE[query.client_record.q.qtype]
+                    request = query.client_record.question(domain, record_type)
                     self.send_to_server(next_hop_ip, request)
-                    log(request_id,
+                    log(query.id,
                         f"Forwarding to {next_hop_ip} for {domain} of type {record_type}")
-                    self.ongoing_queries[request.header.id] = (
-                        record, client_addr, request_id)
+                    self.ongoing_queries[request.header.id] = query
                     return
-        log(request_id, "No additional section with A record found")
+        log(query.id, "No additional section with A record found")
 
     def run(self):
         seq = 0
