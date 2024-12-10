@@ -39,21 +39,48 @@ class Query:
         self.id = request_id
         self.cnames: list[RR] = []
         self.active_zone: str = "."
+        self.last_sent: float = time.time()
+        self.last_question: DNSRecord = None
+        self.last_server: _Address = None
+        self.attempts: int = 0
 
+    # Adds a CNAME record to the query
     def add_cname(self, cname: RR):
         self.cnames.append(cname)
 
+    # Checks if the query has a chain of CNAME records
     def has_chain(self):
         return len(self.cnames) > 0
 
+    # Sets the current active zone of authority for the query
     def set_current_zone(self, zone: str):
         self.active_zone = zone
 
+    # Resets the current active zone of authority to the root zone
     def reset_current_zone(self):
         self.active_zone = "."
 
+    # Updates the last sent time to the current time
+    def refresh_last_sent(self):
+        self.last_sent = time.time()
+
+    # Returns the age of the query in seconds
+    def age(self):
+        return time.time() - self.last_sent
+
+    # Sets the last question and server address that were requested for this recursive query
+    def set_last_question(self, question: DNSRecord, server_addr: _Address):
+        self.last_question = question
+        self.last_server = server_addr
+
+    # Increments the number of attempts made for the query
+    def increment_attempts(self):
+        self.attempts += 1
+
 
 class Server:
+    QUERY_TIMEOUT = 1  # Timeout in seconds
+
     def __init__(self, root_ip, zone_file_path, port):
         self.root_ip = root_ip
         self.zone_file_path = zone_file_path
@@ -70,6 +97,9 @@ class Server:
 
         self.cache: dict[str, (RR, float)] = {}
 
+        self.old_query_ids = []
+
+    # Parses the zone file and loads DNS records
     def parse_zone_file(self):
         zone_files_string = open(self.zone_file_path).read()
         self.records = RR.fromZone(zone_files_string)
@@ -84,10 +114,16 @@ class Server:
         self.log(f"Sending message to {addr}:\n{message}")
         self.socket.sendto(message.pack(), addr)
 
+    # Sends a DNS message to a server at the specified IP address
     def send_to_server(self, ip: str, message: DNSRecord):
         self.send((ip, 60053), message)
 
+    # Sends a DNS question to a server and updates the query state
     def ask_question(self, question: DNSRecord, server_addr: _Address):
+        query = self.ongoing_queries[question.header.id]
+        query.refresh_last_sent()
+        query.set_last_question(question, server_addr)
+        query.increment_attempts()
         self.send_to_server(server_addr, question)
 
     def recv(self, socket: socket.socket):
@@ -100,14 +136,20 @@ class Server:
         # Handle the request
         self.handle_message(request, addr)
 
+    # Handles an incoming DNS message (request or response)
     def handle_message(self, message: DNSRecord, ret_addr: _Address):
         if message.header.qr == 0:
             self.handle_request(message, ret_addr)
         else:
+            if message.header.id in self.old_query_ids:
+                self.log(
+                    f"Received response for old query {message.header.id}, ignoring")
+                return
             filtered_message = self.bailiwick_filter(message)
             self.update_cache(filtered_message)
             self.handle_response(filtered_message, ret_addr)
 
+    # Updates the cache with all records from a DNS response
     def update_cache(self, dns_record: DNSRecord):
         for record in dns_record.rr:
             key = self.cache_format_record(record)
@@ -119,6 +161,7 @@ class Server:
             key = self.cache_format_record(record)
             self.cache[key] = (record, time.time())
 
+    # Filters DNS records based on the bailiwick rule
     def bailiwick_filter(self, dns_record: DNSRecord):
         query = self.ongoing_queries[dns_record.header.id]
         dns_record.rr = self.filter(dns_record.rr, query)
@@ -126,6 +169,7 @@ class Server:
         dns_record.ar = self.filter(dns_record.ar, query)
         return dns_record
 
+    # Filters DNS records using active zone of the query
     def filter(self, records: list[RR], query: Query):
         filtered = []
         for record in records:
@@ -136,6 +180,7 @@ class Server:
                     f"Filtered {record} based on zone {query.active_zone}")
         return filtered
 
+    # Handles an incoming DNS request
     def handle_request(self, dns_record: DNSRecord, client_addr: _Address):
         self.clean_cache()
         if dns_record.q.qname in [record.rname for record in self.records]:
@@ -145,12 +190,15 @@ class Server:
         else:
             self.handle_recursive_request(dns_record, client_addr)
 
+    # Formats a DNS question for caching
     def cache_format_question(self, question: DNSQuestion) -> str:
         return f"{question.qname}|{question.qtype}"
 
+    # Formats a DNS record for caching
     def cache_format_record(self, record: RR) -> str:
         return f"{record.rname}|{record.rtype}"
 
+    # Cleans expired records from the cache
     def clean_cache(self):
         now = time.time()
         for key in list(self.cache.keys()):
@@ -158,22 +206,28 @@ class Server:
             if now - timestamp > record.ttl:
                 del self.cache[key]
 
+    # Handles a DNS request using cached records
     def handle_cached_request(self, dns_record: DNSRecord, client_addr: _Address):
         response = self.response_from_records(
             dns_record, [val[0] for val in self.cache.values()])
         self.send(client_addr, response)
 
+    # Checks if a DNS record matches the type of a DNS question
     def matches_type(self, question: DNSQuestion, record: RR):
         return question.qtype == record.rtype
 
+    # Checks if a DNS record matches a DNS question
     def matches(self, question: DNSQuestion, record: RR):
         return question.qname == record.rname and question.qtype == record.rtype
 
+    # Handles an authoritative DNS request (i.e. for a domain in the zone file
+    # we manage)
     def handle_authoritative_request(self, dns_record: DNSRecord, client_addr: _Address):
         response = self.response_from_records(
             dns_record, self.records, authority=True)
         self.send(client_addr, response)
 
+    # Creates a DNS response from a list of records
     def response_from_records(self, dns_record: DNSRecord, records: list[RR], authority=False):
         response = dns_record.reply()
         response.header.aa = 1 if authority else 0
@@ -182,6 +236,7 @@ class Server:
         self.add_additional_to_response(response, records)
         return response
 
+    # Adds answer records to a DNS response
     def add_answers_to_response(self, dns_record: DNSRecord, response: DNSRecord, records: list[RR]):
         for record in records:
             same_name = record.rname == dns_record.q.qname
@@ -189,6 +244,7 @@ class Server:
             if same_name and same_type:
                 response.add_answer(record)
 
+    # Adds authority records to a DNS response
     def add_authority_to_response(self, response: DNSRecord, records: list[RR]):
         auth_added = False
         auth_domain = str(response.q.qname)
@@ -203,14 +259,15 @@ class Server:
                     auth_added = True
             auth_domain = ".".join(auth_domain.split(".")[1:])
 
+    # Adds additional records to a DNS response
     def add_additional_to_response(self, response: DNSRecord, records: list[RR]):
         for record in response.rr:
             if record.rtype == QTYPE.CNAME or record.rtype == QTYPE.NS:
                 for rec in records:
-                    log(-1, f"Checking {rec.rname} == {record.rdata}")
                     if str(rec.rname) == str(record.rdata) and rec.rtype == QTYPE.A:
                         response.add_ar(rec)
 
+    # Handles a recursive DNS request
     def handle_recursive_request(self, incoming_record: DNSRecord, client_addr: _Address):
         if incoming_record.header.rd == 0:
             self.send_servfail(incoming_record, client_addr)
@@ -228,18 +285,21 @@ class Server:
             incoming_record, client_addr, record_id)
         self.ask_question(question_request, self.root_ip)
 
+    # Sends a SERVFAIL response to the client
     def send_servfail(self, query: Query):
         response = query.client_record.reply()
         response.header.rcode = 2
         self.send(query.client_addr, response)
         self.log("Sending SERVFAIL, recursion flag not set")
 
+    # Handles an incoming DNS response
     def handle_response(self, incoming_record: DNSRecord, server_addr: _Address):
         if incoming_record.header.id in self.ongoing_queries:
             query = self.ongoing_queries[incoming_record.header.id]
             log(query.id,
                 f"Received response from {server_addr} for {incoming_record.q.qname}")
             log(query.id, f"Response:\n{incoming_record}")
+            self.old_query_ids.append(incoming_record.header.id)
             del self.ongoing_queries[incoming_record.header.id]
             if len(incoming_record.auth) == 0 and len(incoming_record.rr) == 0 and len(incoming_record.ar) == 0:
                 log(query.id, "No records found, returning empty response")
@@ -269,6 +329,7 @@ class Server:
         else:
             log(0, f"Received response for unknown query:\n{incoming_record}")
 
+    # Handles a CNAME response and forwards the query
     def handle_cname_response(self, incoming_record: DNSRecord, query: Query):
         log(query.id, "CNAME response, looking for next hop")
         for answer in incoming_record.rr:
@@ -287,6 +348,7 @@ class Server:
                 return
         log(query.id, "No CNAME record found")
 
+    # Sends an authoritative DNS response to the client
     def send_authoritative_response(self, incoming_record: DNSRecord, query: Query):
         log(query.id, "Authoritative response, sending to client")
         response = query.client_record.reply()
@@ -301,6 +363,7 @@ class Server:
             response.add_ar(additional)
         self.send(query.client_addr, response)
 
+    # Forwards a non-authoritative DNS response to the next hop
     def forward_non_authoritative_response(self, incoming_record: DNSRecord, query: Query):
         log(query.id,
             f"Non-authoritative response, looking for next hop...")
@@ -326,6 +389,7 @@ class Server:
                     return
         log(query.id, "No additional section with A record found")
 
+    # Updates the active zone of a query based on the next hop domain
     def update_query_zone(self, query: Query, incoming_record: DNSRecord, next_hop_domain: str):
         zone = next_hop_domain
         if incoming_record.auth:
@@ -335,17 +399,38 @@ class Server:
         log(query.id, f"Updating zone to {zone}")
         query.set_current_zone(zone)
 
+    # Main loop to run the DNS server
     def run(self):
-        seq = 0
         while True:
             socks = select.select([self.socket], [], [], 0.1)[0]
             for conn in socks:
                 self.recv(conn)
+            self.resend_old_queries()
+            self.fail_old_queries()
 
-        return
+    # Resends old queries that have timed out
+    def resend_old_queries(self):
+        for query in self.ongoing_queries.values():
+            if query.age() > self.QUERY_TIMEOUT:
+                if query.attempts < 6:
+                    log(query.id, "Query timed out, resending")
+                    self.ask_question(query.last_question, query.last_server)
+
+    # Fails old queries that have exceeded the maximum number of attempts
+    def fail_old_queries(self):
+        to_delete = []
+        for request_id, query in self.ongoing_queries.items():
+            if query.attempts > 6 and query.age() > self.QUERY_TIMEOUT:
+                log(query.id, "Query timed out, sending SERVFAIL")
+                self.send_servfail(query)
+                to_delete.append(request_id)
+        for request_id in to_delete:
+            self.old_query_ids.append(request_id)
+            del self.ongoing_queries[request_id]
 
 
 if __name__ == "__main__":
+    # Parses command-line arguments and starts the DNS server
     parser = argparse.ArgumentParser(description='send data')
     parser.add_argument('root_ip', type=str,
                         help="The IP address of the root server")
