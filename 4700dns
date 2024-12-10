@@ -37,13 +37,20 @@ class Query:
         self.client_record = client_record
         self.client_addr = client_addr
         self.id = request_id
-        self.cnames = []
+        self.cnames: list[RR] = []
+        self.active_zone: str = "."
 
     def add_cname(self, cname: RR):
         self.cnames.append(cname)
 
     def has_chain(self):
         return len(self.cnames) > 0
+
+    def set_current_zone(self, zone: str):
+        self.active_zone = zone
+
+    def reset_current_zone(self):
+        self.active_zone = "."
 
 
 class Server:
@@ -61,6 +68,8 @@ class Server:
 
         self.ongoing_queries: dict[int, Query] = {}
 
+        self.cache: dict[str, (RR, float)] = {}
+
     def parse_zone_file(self):
         zone_files_string = open(self.zone_file_path).read()
         self.records = RR.fromZone(zone_files_string)
@@ -71,12 +80,15 @@ class Server:
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
-    def send_to_server(self, ip: str, message: DNSRecord):
-        self.send((ip, 60053), message)
-
     def send(self, addr: _Address, message: DNSRecord):
         self.log(f"Sending message to {addr}:\n{message}")
         self.socket.sendto(message.pack(), addr)
+
+    def send_to_server(self, ip: str, message: DNSRecord):
+        self.send((ip, 60053), message)
+
+    def ask_question(self, question: DNSRecord, server_addr: _Address):
+        self.send_to_server(server_addr, question)
 
     def recv(self, socket: socket.socket):
         data, addr = socket.recvfrom(65535)
@@ -92,13 +104,64 @@ class Server:
         if message.header.qr == 0:
             self.handle_request(message, ret_addr)
         else:
-            self.handle_response(message, ret_addr)
+            filtered_message = self.bailiwick_filter(message)
+            self.update_cache(filtered_message)
+            self.handle_response(filtered_message, ret_addr)
+
+    def update_cache(self, dns_record: DNSRecord):
+        for record in dns_record.rr:
+            key = self.cache_format_record(record)
+            self.cache[key] = (record, time.time())
+        for record in dns_record.auth:
+            key = self.cache_format_record(record)
+            self.cache[key] = (record, time.time())
+        for record in dns_record.ar:
+            key = self.cache_format_record(record)
+            self.cache[key] = (record, time.time())
+
+    def bailiwick_filter(self, dns_record: DNSRecord):
+        query = self.ongoing_queries[dns_record.header.id]
+        dns_record.rr = self.filter(dns_record.rr, query)
+        dns_record.auth = self.filter(dns_record.auth, query)
+        dns_record.ar = self.filter(dns_record.ar, query)
+        return dns_record
+
+    def filter(self, records: list[RR], query: Query):
+        filtered = []
+        for record in records:
+            if str(record.rname).endswith(query.active_zone):
+                filtered.append(record)
+            else:
+                log(query.id,
+                    f"Filtered {record} based on zone {query.active_zone}")
+        return filtered
 
     def handle_request(self, dns_record: DNSRecord, client_addr: _Address):
+        self.clean_cache()
         if dns_record.q.qname in [record.rname for record in self.records]:
             self.handle_authoritative_request(dns_record, client_addr)
+        elif self.cache_format_question(dns_record.q) in self.cache:
+            self.handle_cached_request(dns_record, client_addr)
         else:
             self.handle_recursive_request(dns_record, client_addr)
+
+    def cache_format_question(self, question: DNSQuestion) -> str:
+        return f"{question.qname}|{question.qtype}"
+
+    def cache_format_record(self, record: RR) -> str:
+        return f"{record.rname}|{record.rtype}"
+
+    def clean_cache(self):
+        now = time.time()
+        for key in list(self.cache.keys()):
+            record, timestamp = self.cache[key]
+            if now - timestamp > record.ttl:
+                del self.cache[key]
+
+    def handle_cached_request(self, dns_record: DNSRecord, client_addr: _Address):
+        response = self.response_from_records(
+            dns_record, [val[0] for val in self.cache.values()])
+        self.send(client_addr, response)
 
     def matches_type(self, question: DNSQuestion, record: RR):
         return question.qtype == record.rtype
@@ -107,36 +170,45 @@ class Server:
         return question.qname == record.rname and question.qtype == record.rtype
 
     def handle_authoritative_request(self, dns_record: DNSRecord, client_addr: _Address):
-        response = dns_record.reply()
-        self.add_answers_to_response(dns_record, response)
-        self.add_authority_to_response(response)
-        self.add_additional_to_response(response)
+        response = self.response_from_records(
+            dns_record, self.records, authority=True)
         self.send(client_addr, response)
 
-    def add_answers_to_response(self, dns_record: DNSRecord, response: DNSRecord):
-        for record in self.records:
+    def response_from_records(self, dns_record: DNSRecord, records: list[RR], authority=False):
+        response = dns_record.reply()
+        response.header.aa = 1 if authority else 0
+        self.add_answers_to_response(dns_record, response, records)
+        self.add_authority_to_response(response, records)
+        self.add_additional_to_response(response, records)
+        return response
+
+    def add_answers_to_response(self, dns_record: DNSRecord, response: DNSRecord, records: list[RR]):
+        for record in records:
             same_name = record.rname == dns_record.q.qname
             same_type = record.rtype == dns_record.q.qtype
             if same_name and same_type:
                 response.add_answer(record)
 
-    def add_authority_to_response(self, response: DNSRecord):
+    def add_authority_to_response(self, response: DNSRecord, records: list[RR]):
         auth_added = False
         auth_domain = str(response.q.qname)
+        if response.q.qtype == QTYPE.NS:
+            return
         while not auth_added:
             if auth_domain == "":
                 break
-            for record in self.records:
+            for record in records:
                 if str(record.rname) == auth_domain and record.rtype == QTYPE.NS:
                     response.add_auth(record)
                     auth_added = True
             auth_domain = ".".join(auth_domain.split(".")[1:])
 
-    def add_additional_to_response(self, response: DNSRecord):
-        for record in self.records:
+    def add_additional_to_response(self, response: DNSRecord, records: list[RR]):
+        for record in response.rr:
             if record.rtype == QTYPE.CNAME or record.rtype == QTYPE.NS:
-                for rec in self.records:
-                    if rec.rname == record.rdata and rec.rtype == QTYPE.A:
+                for rec in records:
+                    log(-1, f"Checking {rec.rname} == {record.rdata}")
+                    if str(rec.rname) == str(record.rdata) and rec.rtype == QTYPE.A:
                         response.add_ar(rec)
 
     def handle_recursive_request(self, incoming_record: DNSRecord, client_addr: _Address):
@@ -145,16 +217,16 @@ class Server:
             return
         domain = incoming_record.q.qname
         record_type = QTYPE[incoming_record.q.qtype]
-        request = DNSRecord.question(domain, record_type)
+        question_request = DNSRecord.question(domain, record_type)
         record_id = incoming_record.header.id
-        request_id = request.header.id
+        request_id = question_request.header.id
         log(record_id,
             f"Received request for {domain} of type {record_type} from {client_addr}")
         log(record_id, f"Sending request to {self.root_ip}")
-        log(record_id, f"Request:\n{request}")
-        self.send_to_server(self.root_ip, request)
+        log(record_id, f"Request:\n{question_request}")
         self.ongoing_queries[request_id] = Query(
             incoming_record, client_addr, record_id)
+        self.ask_question(question_request, self.root_ip)
 
     def send_servfail(self, query: Query):
         response = query.client_record.reply()
@@ -169,12 +241,18 @@ class Server:
                 f"Received response from {server_addr} for {incoming_record.q.qname}")
             log(query.id, f"Response:\n{incoming_record}")
             del self.ongoing_queries[incoming_record.header.id]
-            if incoming_record.header.aa == 1:
-                follow_chain = True
+            if len(incoming_record.auth) == 0 and len(incoming_record.rr) == 0 and len(incoming_record.ar) == 0:
+                log(query.id, "No records found, returning empty response")
+                self.send_authoritative_response(incoming_record, query)
+            elif incoming_record.header.aa == 1:
+                has_match = False
+                has_cname = False
                 for answer in incoming_record.rr:
                     if self.matches_type(query.client_record.q, answer):
-                        follow_chain = False
-                if follow_chain:
+                        has_match = True
+                    if answer.rtype == QTYPE.CNAME:
+                        has_cname = True
+                if not has_match and has_cname:
                     self.handle_cname_response(incoming_record, query)
                 else:
                     self.send_authoritative_response(incoming_record, query)
@@ -197,12 +275,13 @@ class Server:
             if answer.rtype == QTYPE.CNAME:
                 domain = str(answer.rdata)
                 record_type = QTYPE[query.client_record.q.qtype]
-                request = query.client_record.question(domain, record_type)
+                question_request = DNSRecord.question(domain, record_type)
                 for answer in incoming_record.rr:
                     if answer.rtype == QTYPE.CNAME:
                         query.add_cname(answer)
-                self.ongoing_queries[request.header.id] = query
-                self.send_to_server(self.root_ip, request)
+                query.reset_current_zone()
+                self.ongoing_queries[question_request.header.id] = query
+                self.ask_question(question_request, self.root_ip)
                 log(query.id,
                     f"Forwarding to {self.root_ip} for {domain} of type {record_type}")
                 return
@@ -230,6 +309,8 @@ class Server:
         if incoming_record.ar:
             for additional in incoming_record.ar:
                 if additional.rtype == QTYPE.A:
+                    self.update_query_zone(
+                        query, incoming_record, str(additional.rname))
                     next_hop_ip = str(additional.rdata)
                     domain = query.client_record.q.qname
                     # If the query has a chain of CNAMEs, use the last CNAME as
@@ -237,13 +318,22 @@ class Server:
                     if query.has_chain():
                         domain = str(query.cnames[-1].rdata)
                     record_type = QTYPE[query.client_record.q.qtype]
-                    request = query.client_record.question(domain, record_type)
-                    self.send_to_server(next_hop_ip, request)
+                    question_request = DNSRecord.question(domain, record_type)
+                    self.ongoing_queries[question_request.header.id] = query
+                    self.ask_question(question_request, next_hop_ip)
                     log(query.id,
                         f"Forwarding to {next_hop_ip} for {domain} of type {record_type}")
-                    self.ongoing_queries[request.header.id] = query
                     return
         log(query.id, "No additional section with A record found")
+
+    def update_query_zone(self, query: Query, incoming_record: DNSRecord, next_hop_domain: str):
+        zone = next_hop_domain
+        if incoming_record.auth:
+            for auth in incoming_record.auth:
+                if str(auth.rdata) == next_hop_domain:
+                    zone = str(auth.rname)
+        log(query.id, f"Updating zone to {zone}")
+        query.set_current_zone(zone)
 
     def run(self):
         seq = 0
