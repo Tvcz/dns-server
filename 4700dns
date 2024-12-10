@@ -183,7 +183,9 @@ class Server:
     # Handles an incoming DNS request
     def handle_request(self, dns_record: DNSRecord, client_addr: _Address):
         self.clean_cache()
-        if dns_record.q.qname in [record.rname for record in self.records]:
+        local_names = [str(record.rname) for record in self.records]
+        record_name = str(dns_record.q.qname)
+        if record_name in local_names or any([record_name.endswith(f".{local_name}") for local_name in local_names]):
             self.handle_authoritative_request(dns_record, client_addr)
         elif self.cache_format_question(dns_record.q) in self.cache:
             self.handle_cached_request(dns_record, client_addr)
@@ -225,24 +227,33 @@ class Server:
     def handle_authoritative_request(self, dns_record: DNSRecord, client_addr: _Address):
         response = self.response_from_records(
             dns_record, self.records, authority=True)
+        if len(response.rr) == 0:
+            response.header.rcode = 3
         self.send(client_addr, response)
 
     # Creates a DNS response from a list of records
     def response_from_records(self, dns_record: DNSRecord, records: list[RR], authority=False):
         response = dns_record.reply()
         response.header.aa = 1 if authority else 0
-        self.add_answers_to_response(dns_record, response, records)
+        self.add_answers_to_response(dns_record, response, records, authority)
         self.add_authority_to_response(response, records)
-        self.add_additional_to_response(response, records)
+        self.add_additional_to_response(response, records, authority)
         return response
 
     # Adds answer records to a DNS response
-    def add_answers_to_response(self, dns_record: DNSRecord, response: DNSRecord, records: list[RR]):
+    def add_answers_to_response(self, dns_record: DNSRecord, response: DNSRecord, records: list[RR], authority=False):
         for record in records:
             same_name = record.rname == dns_record.q.qname
             same_type = record.rtype == dns_record.q.qtype
-            if same_name and same_type:
+            if same_name and (same_type or (record.rtype == QTYPE.CNAME and authority)):
+                log(dns_record.header.id, f"Found matching record: {record}")
                 response.add_answer(record)
+                if record.rtype == QTYPE.CNAME:
+                    for other_record in records:
+                        if str(other_record.rname) == str(record.rdata):
+                            log(dns_record.header.id,
+                                f"Found matching CNAME: {other_record}")
+                            response.add_answer(other_record)
 
     # Adds authority records to a DNS response
     def add_authority_to_response(self, response: DNSRecord, records: list[RR]):
@@ -260,9 +271,10 @@ class Server:
             auth_domain = ".".join(auth_domain.split(".")[1:])
 
     # Adds additional records to a DNS response
-    def add_additional_to_response(self, response: DNSRecord, records: list[RR]):
+    def add_additional_to_response(self, response: DNSRecord, records: list[RR], authority=False):
         for record in response.rr:
-            if record.rtype == QTYPE.CNAME or record.rtype == QTYPE.NS:
+            cname_type = record.rtype == QTYPE.CNAME and not authority
+            if cname_type or record.rtype == QTYPE.NS:
                 for rec in records:
                     if str(rec.rname) == str(record.rdata) and rec.rtype == QTYPE.A:
                         response.add_ar(rec)
@@ -413,7 +425,8 @@ class Server:
         for query in self.ongoing_queries.values():
             if query.age() > self.QUERY_TIMEOUT:
                 if query.attempts < 6:
-                    log(query.id, "Query timed out, resending")
+                    log(query.id,
+                        f"Query timed out, resending. Attempts: {query.attempts}")
                     self.ask_question(query.last_question, query.last_server)
 
     # Fails old queries that have exceeded the maximum number of attempts
